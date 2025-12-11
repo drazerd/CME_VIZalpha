@@ -1,0 +1,12 @@
+streamlit
+numpy
+pandas
+matplotlib
+plotly
+astropy
+python-dateutil
+sunpy
+cdflib
+imageio
+kaleido
+requests
