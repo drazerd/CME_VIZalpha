@@ -598,10 +598,10 @@ def load_data_for_spacecraft(spacecraft_name, data_mode, uploads, t_cme_start, t
         elif key == "wind":
             return load_sample_wind()
 
-    if data_mode == "Upload CSVs":
+    if data_mode == "Upload Files":
         mag_file, swa_file, pos_file = uploads
         if mag_file is None:
-            raise ValueError("MAG CSV is required for Upload CSVs mode.")
+            raise ValueError("MAG CSV is required for Upload Files mode.")
         # Parse what is present; caller logic decides if V/R needed
         tbl_B = ascii.read(mag_file)
         tbl_V = ascii.read(swa_file) if (swa_file is not None) else tbl_B
@@ -623,7 +623,7 @@ def load_data_for_spacecraft(spacecraft_name, data_mode, uploads, t_cme_start, t
         else:
             raise RuntimeError(
                 f"CDAWeb is not available for {spacecraft_name}. "
-                "Select 'Upload CSVs' instead."
+                "Select 'Upload Files' instead."
             )
 
     raise ValueError(f"Unknown data mode '{data_mode}'.")
@@ -956,7 +956,7 @@ def generate_cme_frames(
             sm = ScalarMappable(cmap=cmap, norm=norm)
             sm.set_array([])
             cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
-            cb.set_label("|B| (nT)")
+            cb.set_label(r"$|B|$ (nT)")
             cb.ax.tick_params(labelsize=8)
 
         buf = io.BytesIO()
@@ -1122,14 +1122,23 @@ with st.sidebar:
         "Data source",
         [
             "Bundled sample",
-            "Upload CSVs",
+            "Upload Files",
             "CDAWeb (SolO)",
         ],
         index=0 if profile["has_sample_data"] else 1,
     )
 
+    
+    # Temporal-only checkbox BEFORE CSV upload widgets so we can hide V/R when temporal-only
+    temporal_only = st.checkbox(
+        "Temporal-only plots (skip spatial remap)",
+        value=False,
+        help="If set, create only temporal panels (angle vs time, hodogram). Useful when V or R not available or for Aditya L1."
+    )
+
+
     st.markdown("---")
-    st.markdown("### Uploads / Optional NETCDF")
+    st.markdown("### Upload Files")
 
     # Show NETCDF uploader only when Aditya L1 selected
     uploaded_netcdf = None
@@ -1140,16 +1149,9 @@ with st.sidebar:
             accept_multiple_files=False,
         )
 
-    # Temporal-only checkbox BEFORE CSV upload widgets so we can hide V/R when temporal-only
-    temporal_only = st.checkbox(
-        "Temporal-only plots (skip spatial remap)",
-        value=False,
-        help="If set, create only temporal panels (angle vs time, hodogram). Useful when V or R not available or for Aditya L1."
-    )
-
-    # Upload CSVs — show MAG always (unless Aditya L1: encourage .nc upload only); show V and R only if NOT temporal-only
+    # Upload Files — show MAG always (unless Aditya L1: encourage .nc upload only); show V and R only if NOT temporal-only
     uploaded_mag = uploaded_swa = uploaded_pos = None
-    if data_mode == "Upload CSVs":
+    if data_mode == "Upload Files":
         if spacecraft_name == "Aditya L1":
             st.warning("For Aditya L1 prefer uploading .nc files (use the NETCDF uploader shown above). CSV RTN uploads are not provided for Aditya L1.")
         else:
@@ -1201,7 +1203,7 @@ st.info(
 )
 st.warning(
     "⚠️ CDAWeb mode is limited to 48 hours\n\n"
-    "⚠️ CDAWeb mode for WIND is not yet supported."
+    "⚠️ CDAWeb mode is only supported for Solar Orbiter."
 )
 
 
@@ -1221,7 +1223,7 @@ tab_remap, tab_donki = st.tabs(["Visualizer", "DONKI helper"])
 
 with tab_remap:
     # ----------------------- Plot style & animation --------------------------#
-    with st.expander("Advanced plot & GIF settings", expanded=False):
+    with st.expander("Plot Settings", expanded=False):
         st.markdown("#### 3D engine & colormaps")
         col1, col2 = st.columns(2)
 
@@ -1344,7 +1346,7 @@ with tab_remap:
 
         # ------------- Colormap preview thumbnails ------------- #
         with st.expander("Colormap previews", expanded=False):
-            st.markdown("**|B| colormaps**")
+            st.markdown(r"$|B|$ **colormaps**")
             cols_prev = st.columns(3)
             for i, cmap_name in enumerate(mag_cmap_options):
                 with cols_prev[i % 3]:
@@ -1365,7 +1367,7 @@ with tab_remap:
         make_gif_flag = False
         make_rot_gif_flag = False
         # ---- GIF controls: separate, only detailed settings when enabled ----#
-        st.markdown("#### GIF controls")
+    with st.expander("GIF controls", expanded = False):
         gif_col1, gif_col2 = st.columns(2)
         with gif_col1:
             make_gif_flag = st.checkbox(
@@ -1381,42 +1383,41 @@ with tab_remap:
             )
 
         if make_gif_flag or make_rot_gif_flag:
-            with st.expander("GIF settings", expanded=True):
-                gif_frames = st.slider("GIF frames", 10, 80, 40)
-                gif_dpi = st.slider(
-                    "GIF resolution (DPI)",
-                    min_value=80,
-                    max_value=240,
-                    value=140,
-                    step=10,
-                )
-                gif_show_colorbar = st.checkbox(
-                    "Show colorbar in evolution GIF", value=True
-                )
-                rot_elev = st.slider(
-                    "Rotation elevation (deg)",
-                    min_value=0,
-                    max_value=80,
-                    value=20,
-                    step=5,
-                )
-                rot_direction_choice = st.radio(
-                    "Rotation direction",
-                    ["Counter-clockwise", "Clockwise"],
-                    index=0,
-                    horizontal=True,
-                )
-                rot_direction = (
-                    1 if rot_direction_choice == "Counter-clockwise" else -1
-                )
-                rot_speed = st.slider(
-                    "Rotation speed (sec/frame)",
-                    min_value=0.05,
-                    max_value=0.4,
-                    value=0.12,
-                    step=0.01,
-                    help="Lower = faster rotation.",
-                )
+            gif_frames = st.slider("GIF frames", 10, 80, 40)
+            gif_dpi = st.slider(
+                "GIF resolution (DPI)",
+                min_value=80,
+                max_value=240,
+                value=140,
+                step=10,
+            )
+            gif_show_colorbar = st.checkbox(
+                "Show colorbar in evolution GIF", value=True
+            )
+            rot_elev = st.slider(
+                "Rotation elevation (deg)",
+                min_value=0,
+                max_value=80,
+                value=20,
+                step=5,
+            )
+            rot_direction_choice = st.radio(
+                "Rotation direction",
+                ["Counter-clockwise", "Clockwise"],
+                index=0,
+                horizontal=True,
+            )
+            rot_direction = (
+                1 if rot_direction_choice == "Counter-clockwise" else -1
+            )
+            rot_speed = st.slider(
+                "Rotation speed (sec/frame)",
+                min_value=0.05,
+                max_value=0.4,
+                value=0.12,
+                step=0.01,
+                help="Lower = faster rotation.",
+            )
         else:
             gif_frames = 40
             gif_dpi = 140
@@ -1430,13 +1431,13 @@ with tab_remap:
         if event_name.strip() == "":
             st.error("Please enter an event label before running the remapping.")
             st.stop()
-        if spacecraft_name == "WIND" and data_mode == "CDAWeb (SolO)":
-            st.error("WIND CDAWeb download is not supported yet. Please use CSV upload mode.")
+        if spacecraft_name != "Solar Orbiter" and data_mode == "CDAWeb (SolO)":
+            st.error("CDAWeb download is not supported yet for this spacecraft. Please use CSV/nc upload mode.")
             st.stop()
 
         # If Aditya selected, enforce temporal-only and recommend .nc (GSM)
         if spacecraft_name == "Aditya L1":
-            st.warning("Aditya L1 selected — spatial remap is disabled. Aditya data is GSM MAG-only; upload .nc files or CSV MAG (GSM).")
+            st.warning("Aditya L1 selected — spatial remap is disabled. Aditya data is GSM MAG-only; upload .nc files")
             temporal_only = True
 
         try:
@@ -1578,7 +1579,7 @@ with tab_remap:
                     sm = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap=cmap_obj)
                     sm.set_array([])
                     cbar = fig1.colorbar(sm, cax=cax1, orientation="horizontal")
-                    cbar.set_label("|B| (nT)", color=label_color)
+                    cbar.set_label(r"$|B|$ (nT)", color=label_color)
                     cbar.ax.tick_params(colors=label_color)
                     ax1.tick_params(colors=label_color)
                     fig1.autofmt_xdate()
@@ -1611,7 +1612,7 @@ with tab_remap:
                     ax2.set_ylabel(r"$B_Z$ (nT) — GSM" if spacecraft_name == "Aditya L1" else r"$B_Z$ (nT)", color=label_color)
                     ax2.grid(True, linestyle="--", alpha=0.2)
                     cbar2 = fig2.colorbar(sc2, ax=ax2, orientation="vertical", pad=0.02)
-                    cbar2.set_label("|B| (nT)", color=label_color)
+                    cbar2.set_label(r"$|B|$ (nT)", color=label_color)
                     cbar2.ax.tick_params(colors=label_color)
                     ax2.tick_params(colors=label_color)
                     st.pyplot(fig2)
@@ -1715,7 +1716,7 @@ with tab_remap:
     
                             # cosmetic labels and horizontal colormap bar (like spatial)
                             label_color = "white" if bg in ("black", "transparent") else "black"
-                            ax3.set_xlabel("Time (UTC numeric)", color=label_color)
+                            ax3.set_xlabel("Time (UTC numeric)", labelpad = 50, color=label_color)
                             ax3.set_ylabel(r"$T_0$-like (arb)", color=label_color)
                             ax3.set_zlabel(r"$N_0$-like (arb)", color=label_color)
                             ax3.tick_params(colors=label_color)
@@ -1725,7 +1726,7 @@ with tab_remap:
                             sm3.set_array([])
                             cax_pos = fig3.add_axes([0.18, 0.16, 0.64, 0.055])
                             cbar3 = fig3.colorbar(sm3, cax=cax_pos, orientation="horizontal")
-                            cbar3.set_label("|B| (nT)", color=label_color)
+                            cbar3.set_label(r"$|B|$ (nT)", color=label_color)
                             cbar3.ax.tick_params(colors=label_color)
                             cbar3.outline.set_edgecolor(label_color)
     
@@ -1956,7 +1957,7 @@ with tab_remap:
                                 else 0.8,
                                 showscale=True,
                                 colorbar=dict(
-                                title=dict(text="|B| (nT)", font=dict(color=label_color)),
+                                title=dict(text=r"$|B|$ (nT)", font=dict(color=label_color)),
                                 tickfont=dict(color=label_color),
                                 len=0.70,
                                 y=0.48,
@@ -2279,7 +2280,7 @@ with tab_remap:
                     cbar_mag = fig.colorbar(
                         sm_mag, cax=cax_mag, orientation="horizontal"
                     )
-                    cbar_mag.set_label("|B| (nT)", color=label_color)
+                    cbar_mag.set_label(r"$|B|$ (nT)", color=label_color)
                     cbar_mag.ax.tick_params(colors=label_color)
                     cbar_mag.outline.set_edgecolor(label_color)
 
