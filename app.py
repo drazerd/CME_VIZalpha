@@ -1,10 +1,12 @@
 import datetime as dt
 from datetime import timedelta
 import io
+import tempfile
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 from astropy.io import ascii
 from dateutil import parser
@@ -15,11 +17,62 @@ import plotly.graph_objects as go
 from matplotlib.colors import Normalize, TwoSlopeNorm, to_rgba
 from matplotlib.cm import ScalarMappable
 from matplotlib.ticker import MaxNLocator
-from matplotlib.patches import Patch  # for legend entries on planes
+from matplotlib.patches import Patch, Circle  # for legend entries and hodogram circles
+
+from netCDF4 import Dataset as NetCDFDataset, num2date
 
 from modules import solgaleo, remapping, Finding_v_leading_and_trailing as vfit
 
 AU = 149_597_870.7  # km
+
+# =============================================================================
+# Helper: timezone normalization (robust)
+# =============================================================================
+
+
+def _ensure_utc(dt_obj):
+    """
+    Return a timezone-aware datetime in UTC.
+
+    Accepts:
+      - python datetime
+      - pandas.Timestamp
+      - numpy.datetime64
+      - string (will be parsed)
+    If naive, treat as UTC (this is the policy for in-situ spacecraft times).
+    """
+    import dateutil.parser as _parser
+
+    if dt_obj is None:
+        return None
+
+    # pandas Timestamp
+    if isinstance(dt_obj, pd.Timestamp):
+        dt_obj = dt_obj.to_pydatetime()
+
+    # numpy.datetime64
+    try:
+        if type(dt_obj).__name__ == "datetime64":
+            dt_obj = pd.to_datetime(dt_obj).to_pydatetime()
+    except Exception:
+        pass
+
+    # If it's already a datetime-like object with tzinfo
+    if hasattr(dt_obj, "tzinfo"):
+        if dt_obj.tzinfo is None:
+            return dt_obj.replace(tzinfo=dt.timezone.utc)
+        else:
+            return dt_obj.astimezone(dt.timezone.utc)
+
+    # Strings etc. — parse
+    try:
+        parsed = _parser.parse(str(dt_obj))
+    except Exception:
+        raise TypeError(f"Can't interpret {dt_obj!r} as datetime")
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
 
 # =============================================================================
 # Spacecraft configuration
@@ -64,6 +117,15 @@ SPACECRAFT_PROFILES = {
             "pos": "WIND_HELIO1HR_POSITION",
         },
     },
+    "Aditya L1": {
+        "key": "al1",
+        "has_sample_data": False,
+        # Aditya L1: MAG in GSM only (typical .nc variable names guessed)
+        "cols": {
+            "time": "time",
+            "B": ["Bx_gsm", "By_gsm", "Bz_gsm"],
+        },
+    },
 }
 
 # =============================================================================
@@ -71,7 +133,7 @@ SPACECRAFT_PROFILES = {
 # =============================================================================
 
 st.set_page_config(
-    page_title="CME Spatial Remapping",
+    page_title="CME Viz",
     layout="wide",
 )
 
@@ -82,6 +144,7 @@ st.set_page_config(
 
 import base64
 
+
 def show_gif_inline(gif_bytes: bytes, caption: str | None = None):
     """Display an animated GIF in Streamlit using raw HTML so it actually animates."""
     b64 = base64.b64encode(gif_bytes).decode("utf-8")
@@ -90,14 +153,27 @@ def show_gif_inline(gif_bytes: bytes, caption: str | None = None):
     if caption:
         st.caption(caption)
 
+
 def check_time_coverage(name, t_series, t_start, t_end):
-    t0 = t_series[0]
-    t1 = t_series[-1]
-    if t0 > t_start or t1 < t_end:
+    """
+    Verify that [t_start, t_end] lies within the t_series available interval.
+
+    t_series: list-like of datetimes (may be naive) -> normalized to UTC.
+    t_start/t_end: datetimes (likely timezone-aware) -> normalized to UTC.
+    """
+    if t_series is None or len(t_series) == 0:
+        raise ValueError(f"{name} has no timestamps; cannot check coverage.")
+
+    t0 = _ensure_utc(t_series[0])
+    t1 = _ensure_utc(t_series[-1])
+    t_start_u = _ensure_utc(t_start)
+    t_end_u = _ensure_utc(t_end)
+
+    if t0 > t_start_u or t1 < t_end_u:
         raise ValueError(
             f"{name} time range [{t0} – {t1}] does not fully cover "
-            f"requested interval [{t_start} – {t_end}].\n\n"
-            "Adjust CME start/end times to lie within the data range."
+            f"requested interval [{t_start_u} – {t_end_u}].\n\n"
+            "Adjust CME start/end times to lie within the data range or upload data that covers the requested interval."
         )
 
 
@@ -111,7 +187,7 @@ def format_tdelta(td: timedelta) -> str:
 
 
 def colormap_preview_bytes(cmap_name: str) -> bytes:
-    """Return a small PNG gradient for a Matplotlib colormap."""
+    """Return a small PNG gradient for a Matplotlib colormap.""" 
     gradient = np.linspace(0, 1, 256).reshape(1, -1)
     fig, ax = plt.subplots(figsize=(2.4, 0.4))
     ax.imshow(gradient, aspect="auto", cmap=plt.colormaps.get_cmap(cmap_name))
@@ -124,7 +200,7 @@ def colormap_preview_bytes(cmap_name: str) -> bytes:
 
 
 # =============================================================================
-# CSV loaders (bundled + uploaded)
+# CSV loaders (bundled + uploaded) — ensure times normalized to UTC
 # =============================================================================
 
 
@@ -134,24 +210,44 @@ def parse_csv_tables(spacecraft_name, tbl_B, tbl_V, tbl_R):
     time_col = cols["time"]
 
     # MAG
-    t_B = [parser.isoparse(t) for t in tbl_B[time_col]]
-    B_r = tbl_B[cols["B"][0]]
-    B_t = tbl_B[cols["B"][1]]
-    B_n = tbl_B[cols["B"][2]]
+    t_B = []
+    for t in tbl_B[time_col]:
+        try:
+            dt_parsed = parser.isoparse(str(t))
+        except Exception:
+            dt_parsed = pd.to_datetime(str(t))
+        t_B.append(_ensure_utc(dt_parsed))
+
+    B_r = np.asarray(tbl_B[cols["B"][0]], dtype=float)
+    B_t = np.asarray(tbl_B[cols["B"][1]], dtype=float)
+    B_n = np.asarray(tbl_B[cols["B"][2]], dtype=float)
     B_rtn = np.column_stack((B_r, B_t, B_n))
 
     # V
-    t_V = [parser.isoparse(t) for t in tbl_V[time_col]]
-    V_r = tbl_V[cols["V"][0]]
-    V_t = tbl_V[cols["V"][1]]
-    V_n = tbl_V[cols["V"][2]]
+    t_V = []
+    for t in tbl_V[time_col]:
+        try:
+            dt_parsed = parser.isoparse(str(t))
+        except Exception:
+            dt_parsed = pd.to_datetime(str(t))
+        t_V.append(_ensure_utc(dt_parsed))
+    V_r = np.asarray(tbl_V[cols["V"][0]], dtype=float)
+    V_t = np.asarray(tbl_V[cols["V"][1]], dtype=float)
+    V_n = np.asarray(tbl_V[cols["V"][2]], dtype=float)
     V_rtn = np.column_stack((V_r, V_t, V_n))
 
     # Position (HGI)
-    t_R = [parser.isoparse(t) for t in tbl_R[time_col]]
-    R_sc_r = tbl_R[cols["R"][0]] * AU
-    R_sc_lat = tbl_R[cols["R"][1]]
-    R_sc_lon = tbl_R[cols["R"][2]]
+    t_R = []
+    for t in tbl_R[time_col]:
+        try:
+            dt_parsed = parser.isoparse(str(t))
+        except Exception:
+            dt_parsed = pd.to_datetime(str(t))
+        t_R.append(_ensure_utc(dt_parsed))
+
+    R_sc_r = np.asarray(tbl_R[cols["R"][0]], dtype=float) * AU
+    R_sc_lat = np.asarray(tbl_R[cols["R"][1]], dtype=float)
+    R_sc_lon = np.asarray(tbl_R[cols["R"][2]], dtype=float)
     theta = 90 - np.array(R_sc_lat)
     R_sc_hgi = solgaleo.batch_spherical_to_cartesian(
         R_sc_r, theta, R_sc_lon, degrees=True
@@ -187,7 +283,121 @@ def load_sample_wind():
 
 
 # =============================================================================
-# CDAWeb helpers
+# NetCDF loader for MAG uploads (.nc) - Generic (Aditya/GSM-friendly)
+# =============================================================================
+
+
+def _nc_try_num2date(nc, time_var_name):
+    tvar = nc.variables[time_var_name]
+    if hasattr(tvar, "units"):
+        try:
+            dates = num2date(tvar[:], units=tvar.units)
+            dates = [pd.to_datetime(str(d)).to_pydatetime() for d in dates]
+            return [ _ensure_utc(d) for d in dates ]
+        except Exception:
+            pass
+    # fallback: epoch seconds
+    try:
+        return [ _ensure_utc(pd.to_datetime(float(x), unit="s").to_pydatetime()) for x in tvar[:] ]
+    except Exception:
+        raise
+
+
+def load_from_uploaded_netcdf_list(nc_uploaded_files):
+    """
+    Accepts a list of streamlit UploadedFile objects (or a single object).
+    Returns: (t_B, B_arr), ([], []), ([], [])
+    B_arr shape: (N,3) arranged as (Bx, By, Bz) in that order (guessed from var names)
+    """
+    if nc_uploaded_files is None:
+        raise ValueError("No netCDF file(s) provided.")
+
+    if not isinstance(nc_uploaded_files, (list, tuple)):
+        uploaded_list = [nc_uploaded_files]
+    else:
+        uploaded_list = nc_uploaded_files
+
+    times_all = []
+    Bx_all = []
+    By_all = []
+    Bz_all = []
+
+    # variable name candidates (common variations)
+    var_names = {
+        "Bx": ["Bx_gsm", "Bx_gsm_1", "Bx", "B_x", "B1", "BX"],
+        "By": ["By_gsm", "By_gsm_1", "By", "B_y", "B2", "BY"],
+        "Bz": ["Bz_gsm", "Bz_gsm_1", "Bz", "B_z", "B3", "BZ"],
+        "time": ["time", "Time", "epoch", "Epoch"],
+    }
+
+    for up in uploaded_list:
+        # write uploaded bytes to temp file for netCDF4 to open
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+            tmp.write(up.read())
+            tmp.flush()
+            tmp_name = tmp.name
+
+        nc = NetCDFDataset(tmp_name, mode="r")
+
+        # find time variable name
+        tname = None
+        for cand in var_names["time"]:
+            if cand in nc.variables:
+                tname = cand
+                break
+        if tname is None:
+            # fallback: pick first 1D variable
+            for v in nc.variables:
+                arr = nc.variables[v][:]
+                if getattr(arr, "ndim", 0) == 1:
+                    tname = v
+                    break
+        if tname is None:
+            nc.close()
+            raise KeyError("No time variable found in netCDF")
+
+        # robust conversion to datetimes
+        try:
+            t_list = _nc_try_num2date(nc, tname)
+        except Exception:
+            tdata = nc.variables[tname][:]
+            try:
+                t_list = [ _ensure_utc(pd.to_datetime(str(x)).to_pydatetime()) for x in tdata ]
+            except Exception:
+                nc.close()
+                raise
+
+        # B components
+        def _find_var_or_none(nc, candidates):
+            for n in candidates:
+                if n in nc.variables:
+                    try:
+                        return np.array(nc.variables[n][:], dtype=float)
+                    except Exception:
+                        return np.array(nc.variables[n][:].astype(float))
+            return None
+
+        Bx = _find_var_or_none(nc, var_names["Bx"])
+        By = _find_var_or_none(nc, var_names["By"])
+        Bz = _find_var_or_none(nc, var_names["Bz"])
+
+        nc.close()
+
+        if Bx is None or By is None or Bz is None:
+            raise KeyError("Could not find Bx/By/Bz variables in .nc (tried common names)")
+
+        times_all.extend(t_list)
+        Bx_all.extend(Bx.tolist())
+        By_all.extend(By.tolist())
+        Bz_all.extend(Bz.tolist())
+
+    B_arr = np.column_stack((np.array(Bx_all), np.array(By_all), np.array(Bz_all)))
+    t_B = times_all
+    return (t_B, B_arr), ([], []), ([], [])
+
+
+# =============================================================================
+# CDAWeb helpers (unchanged except time normalization)
 # =============================================================================
 
 
@@ -231,7 +441,7 @@ def load_from_cdaweb_solo(t_start, t_end):
     files_mag = Fido.fetch(res_mag)
     ts_mag = TimeSeries(files_mag, concatenate=True)
     df_mag = ts_mag.to_dataframe().sort_index()
-    t_B = list(pd.DatetimeIndex(df_mag.index).tz_localize("UTC").to_pydatetime())
+    t_B = [ _ensure_utc(d.to_pydatetime()) for d in pd.DatetimeIndex(df_mag.index).tz_localize("UTC") ]
 
     mag_cols = list(df_mag.columns)
     if all(c in mag_cols for c in ["B_RTN_0", "B_RTN_1", "B_RTN_2"]):
@@ -252,7 +462,7 @@ def load_from_cdaweb_solo(t_start, t_end):
     files_pl = Fido.fetch(res_pl)
     ts_pl = TimeSeries(files_pl, concatenate=True)
     df_pl = ts_pl.to_dataframe().sort_index()
-    t_V = list(pd.DatetimeIndex(df_pl.index).tz_localize("UTC").to_pydatetime())
+    t_V = [ _ensure_utc(d.to_pydatetime()) for d in pd.DatetimeIndex(df_pl.index).tz_localize("UTC") ]
 
     pl_cols = list(df_pl.columns)
     if all(c in pl_cols for c in ["VR_RTN_km/s", "VT_RTN_km/s", "VN_RTN_km/s"]):
@@ -270,12 +480,12 @@ def load_from_cdaweb_solo(t_start, t_end):
     res_pos = Fido.search(time_attr, ds_pos)
     if len(res_pos) == 0 or len(res_pos[0]) == 0:
         raise RuntimeError(
-            f"No SolO position ({cfg['pos']}) data found in this interval."
+            f"No SolO position ({cfg['pos']}) data found in this interval"
         )
     files_pos = Fido.fetch(res_pos)
     ts_pos = TimeSeries(files_pos, concatenate=True)
     df_pos = ts_pos.to_dataframe().sort_index()
-    t_R = list(pd.DatetimeIndex(df_pos.index).tz_localize("UTC").to_pydatetime())
+    t_R = [ _ensure_utc(d.to_pydatetime()) for d in pd.DatetimeIndex(df_pos.index).tz_localize("UTC") ]
 
     rad_col = _find_column(df_pos, ["rad", "au"], "SolO radial distance [AU]")
     lat_col = _find_column(df_pos, ["hgi", "lat"], "SolO HGI latitude")
@@ -311,7 +521,7 @@ def load_from_cdaweb_wind(t_start, t_end):
     files_mag = Fido.fetch(res_mag)
     ts_mag = TimeSeries(files_mag, concatenate=True)
     df_mag = ts_mag.to_dataframe().sort_index()
-    t_B = list(pd.DatetimeIndex(df_mag.index).tz_localize("UTC").to_pydatetime())
+    t_B = [ _ensure_utc(d.to_pydatetime()) for d in pd.DatetimeIndex(df_mag.index).tz_localize("UTC") ]
 
     mag_cols = list(df_mag.columns)
     if all(c in mag_cols for c in ["BRTN_0", "BRTN_1", "BRTN_2"]):
@@ -329,12 +539,12 @@ def load_from_cdaweb_wind(t_start, t_end):
     res_swe = Fido.search(time_attr, ds_swe)
     if len(res_swe) == 0 or len(res_swe[0]) == 0:
         raise RuntimeError(
-            f"No WIND SWE ({cfg['plasma']}) data found in this interval."
+            f"No WIND SWE ({cfg['plasma']}) data found in this interval"
         )
     files_swe = Fido.fetch(res_swe)
     ts_swe = TimeSeries(files_swe, concatenate=True)
     df_swe = ts_swe.to_dataframe().sort_index()
-    t_V = list(pd.DatetimeIndex(df_swe.index).tz_localize("UTC").to_pydatetime())
+    t_V = [ _ensure_utc(d.to_pydatetime()) for d in pd.DatetimeIndex(df_swe.index).tz_localize("UTC") ]
 
     swe_cols = list(df_swe.columns)
     if all(c in swe_cols for c in ["VR_RTN", "VT_RTN", "VN_RTN"]):
@@ -348,7 +558,7 @@ def load_from_cdaweb_wind(t_start, t_end):
     V_rtn = df_swe[[vr_col, vt_col, vn_col]].to_numpy()
 
     # Position
-    ds_pos = a.cdaweb.Dataset(cfg["pos"])
+    ds_pos = a.cdaweb.Dataset(cfg['pos'])
     res_pos = Fido.search(time_attr, ds_pos)
     if len(res_pos) == 0 or len(res_pos[0]) == 0:
         raise RuntimeError(
@@ -357,7 +567,7 @@ def load_from_cdaweb_wind(t_start, t_end):
     files_pos = Fido.fetch(res_pos)
     ts_pos = TimeSeries(files_pos, concatenate=True)
     df_pos = ts_pos.to_dataframe().sort_index()
-    t_R = list(pd.DatetimeIndex(df_pos.index).tz_localize("UTC").to_pydatetime())
+    t_R = [ _ensure_utc(d.to_pydatetime()) for d in pd.DatetimeIndex(df_pos.index).tz_localize("UTC") ]
 
     rad_col = _find_column(df_pos, ["rad", "au"], "WIND radial distance [AU]")
     lat_col = _find_column(df_pos, ["hgi", "lat"], "WIND HGI latitude")
@@ -390,11 +600,12 @@ def load_data_for_spacecraft(spacecraft_name, data_mode, uploads, t_cme_start, t
 
     if data_mode == "Upload CSVs":
         mag_file, swa_file, pos_file = uploads
-        if not (mag_file and swa_file and pos_file):
-            raise ValueError("Upload all three CSVs: MAG, plasma V, and position.")
+        if mag_file is None:
+            raise ValueError("MAG CSV is required for Upload CSVs mode.")
+        # Parse what is present; caller logic decides if V/R needed
         tbl_B = ascii.read(mag_file)
-        tbl_V = ascii.read(swa_file)
-        tbl_R = ascii.read(pos_file)
+        tbl_V = ascii.read(swa_file) if (swa_file is not None) else tbl_B
+        tbl_R = ascii.read(pos_file) if (pos_file is not None) else tbl_B
         return parse_csv_tables(spacecraft_name, tbl_B, tbl_V, tbl_R)
 
     if data_mode == "CDAWeb (SolO)":
@@ -419,9 +630,8 @@ def load_data_for_spacecraft(spacecraft_name, data_mode, uploads, t_cme_start, t
 
 
 # =============================================================================
-# Remapping core
+# Remapping core (kept unchanged)
 # =============================================================================
-
 
 def compute_remap_for_spacecraft(
     t_B,
@@ -573,7 +783,7 @@ def compute_remap_for_spacecraft(
 
 
 # =============================================================================
-# GIF helpers
+# GIF helpers (generate_cme_frames unchanged except denser arrows)
 # =============================================================================
 
 
@@ -596,12 +806,6 @@ def generate_cme_frames(
     show_colorbar=True,
     arrow_density=150,
 ):
-    """
-    Build frames for a CME evolution GIF that:
-    - grows the CME path over time
-    - shows B-vector quivers
-    - includes CME start / MO start / CME end planes
-    """
     import imageio.v2 as imageio
 
     X_arr = np.asarray(X, dtype=float)
@@ -695,8 +899,8 @@ def generate_cme_frames(
             alpha=0.95,
         )
 
-        # Quivers (subsampled)
-        step = max(1, idx // max(1, arrow_density))
+        # Quivers (subsampled) — densified by factor ~2
+        step = max(1, idx // max(1, int(arrow_density * 2)))
         for j in range(0, idx, step):
             if not np.isfinite(B_arr[j]):
                 continue
@@ -786,6 +990,7 @@ def make_cme_gif(
 ):
     import imageio.v2 as imageio
 
+    # generate_cme_frames does not accept frame_duration — duration supplied to mimsave
     frames = generate_cme_frames(
         X,
         Y,
@@ -821,10 +1026,6 @@ def make_rotation_gif_from_axes(
     direction=1,
     frame_duration=0.12,
 ):
-    """
-    Rotate an existing Matplotlib 3D axes (full CME plot with arrows/planes/etc.)
-    and return a GIF as BytesIO.
-    """
     import imageio.v2 as imageio
 
     frames = []
@@ -853,11 +1054,11 @@ def make_rotation_gif_from_axes(
 # UI: Title
 # =============================================================================
 
-st.title("☀️ CME Spatial Remapping")
+st.title("☀️ CME Viz")
 
 st.caption(
     "Interactively remap in-situ CME measurements into a spatial view, "
-    "using Solar Orbiter or WIND data (sample CSVs, uploads, or CDAWeb)."
+    "using Solar Orbiter, WIND, or Aditya L1 (temporal-only) data."
 )
 
 # =============================================================================
@@ -928,19 +1129,63 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.markdown("### Uploads / Optional NETCDF")
+
+    # Show NETCDF uploader only when Aditya L1 selected
+    uploaded_netcdf = None
+    if spacecraft_name == "Aditya L1":
+        uploaded_netcdf = st.file_uploader(
+            "Upload Aditya L1 MAG netCDF (.nc) files (GSM)",
+            type=["nc"],
+            accept_multiple_files=True,
+        )
+
+    # Temporal-only checkbox BEFORE CSV upload widgets so we can hide V/R when temporal-only
+    temporal_only = st.checkbox(
+        "Temporal-only plots (skip spatial remap)",
+        value=False,
+        help="If set, create only temporal panels (angle vs time, hodogram). Useful when V or R not available or for Aditya L1."
+    )
+
+    # Upload CSVs — show MAG always (unless Aditya L1: encourage .nc upload only); show V and R only if NOT temporal-only
+    uploaded_mag = uploaded_swa = uploaded_pos = None
+    if data_mode == "Upload CSVs":
+        if spacecraft_name == "Aditya L1":
+            st.warning("For Aditya L1 prefer uploading .nc files (use the NETCDF uploader shown above). CSV RTN uploads are not provided for Aditya L1.")
+            # still allow a generic MAG CSV if user insists
+            uploaded_mag = st.file_uploader("MAG CSV (GSM) — optional", type=["csv"])
+        else:
+            st.caption("Use the same column naming convention as your existing CSVs.")
+            uploaded_mag = st.file_uploader("MAG RTN CSV", type=["csv"])
+            if not temporal_only:
+                uploaded_swa = st.file_uploader("Plasma V CSV", type=["csv"])
+                uploaded_pos = st.file_uploader("Position (HGI) CSV", type=["csv"])
+            else:
+                st.caption("Temporal-only selected: Plasma V & Position upload disabled.")
+
+    st.markdown("---")
     st.markdown("### Run")
     do_plot = st.button("Compute & plot")
 
-# Convert sidebar times to aware datetimes
-t_cme_start = dt.datetime.combine(cme_start_date, cme_start_time).replace(
-    tzinfo=dt.timezone.utc
-)
-t_mo_start = dt.datetime.combine(mo_start_date, mo_start_time).replace(
-    tzinfo=dt.timezone.utc
-)
-t_cme_end = dt.datetime.combine(cme_end_date, cme_end_time).replace(
-    tzinfo=dt.timezone.utc
-)
+# Convert sidebar times to aware datetimes (guarded combine)
+if (
+    cme_start_date is None
+    or cme_start_time is None
+    or mo_start_date is None
+    or mo_start_time is None
+    or cme_end_date is None
+    or cme_end_time is None
+):
+    st.error("Please select CME/MO start/end date *and* time in the sidebar before running. One or more date/time inputs are empty.")
+    do_plot = False
+else:
+    try:
+        t_cme_start = _ensure_utc(dt.datetime.combine(cme_start_date, cme_start_time))
+        t_mo_start = _ensure_utc(dt.datetime.combine(mo_start_date, mo_start_time))
+        t_cme_end = _ensure_utc(dt.datetime.combine(cme_end_date, cme_end_time))
+    except TypeError as e:
+        st.error(f"Date/time inputs invalid: {e}")
+        do_plot = False
 
 dt1 = t_mo_start - t_cme_start
 dt2 = t_cme_end - t_mo_start
@@ -965,15 +1210,6 @@ st.warning(
 if t_cme_start >= t_mo_start or t_mo_start >= t_cme_end:
     st.error("Times must satisfy: **CME start < MO start < CME end**.")
     do_plot = False
-
-# Upload widgets if needed
-uploaded_mag = uploaded_swa = uploaded_pos = None
-if data_mode == "Upload CSVs":
-    with st.sidebar.expander("Upload CSVs", expanded=True):
-        st.caption("Use the same column naming convention as your existing CSVs.")
-        uploaded_mag = st.file_uploader("MAG RTN CSV", type=["csv"])
-        uploaded_swa = st.file_uploader("Plasma V CSV", type=["csv"])
-        uploaded_pos = st.file_uploader("Position (HGI) CSV", type=["csv"])
 
 # =============================================================================
 # Main tabs
@@ -1199,21 +1435,423 @@ with tab_remap:
         if spacecraft_name == "WIND" and data_mode == "CDAWeb (SolO)":
             st.error("WIND CDAWeb download is not supported yet. Please use CSV upload mode.")
             st.stop()
+
+        # If Aditya selected, enforce temporal-only and recommend .nc (GSM)
+        if spacecraft_name == "Aditya L1":
+            st.warning("Aditya L1 selected — spatial remap is disabled. Aditya data is GSM MAG-only; upload .nc files or CSV MAG (GSM).")
+            temporal_only = True
+
         try:
             with st.spinner("Loading data…"):
-                (t_B, B_rtn), (t_V, V_rtn), (t_R_sc, R_sc_hgi) = load_data_for_spacecraft(
-                    spacecraft_name,
-                    data_mode,
-                    (uploaded_mag, uploaded_swa, uploaded_pos),
-                    t_cme_start,
-                    t_cme_end,
-                )
+                # prefer uploaded .nc if present for Aditya
+                if spacecraft_name == "Aditya L1" and uploaded_netcdf:
+                    (t_B, B_rtn), (t_V, V_rtn), (t_R_sc, R_sc_hgi) = load_from_uploaded_netcdf_list(uploaded_netcdf)
+                else:
+                    (t_B, B_rtn), (t_V, V_rtn), (t_R_sc, R_sc_hgi) = load_data_for_spacecraft(
+                        spacecraft_name,
+                        data_mode,
+                        (uploaded_mag, uploaded_swa, uploaded_pos),
+                        t_cme_start,
+                        t_cme_end,
+                    )
 
             st.success(
                 f"Loaded {spacecraft_name} data. "
                 f"Time range (MAG): [{t_B[0]} – {t_B[-1]}]"
             )
 
+            # If temporal_only requested or V/R missing, do temporal-only branch
+            v_missing = (t_V is None) or (len(t_V) == 0) or (isinstance(V_rtn, np.ndarray) and V_rtn.size == 0)
+            r_missing = (t_R_sc is None) or (len(t_R_sc) == 0) or (isinstance(R_sc_hgi, np.ndarray) and R_sc_hgi.size == 0)
+
+            # -------------------- Temporal-only branch -------------------- #
+            if temporal_only or v_missing or r_missing:
+                if v_missing or r_missing:
+                    st.info(
+                        "Velocity and/or position data are missing — running temporal-only plotting. "
+                        "Spatial remap requires both velocity (V) and position (R) data."
+                    )
+
+                # STRICT: ensure CME times lie inside MAG time coverage; otherwise abort
+                try:
+                    tB0 = _ensure_utc(t_B[0])
+                    tB1 = _ensure_utc(t_B[-1])
+                    if t_cme_start < tB0 or t_cme_end > tB1:
+                        st.error(
+                            "CME start/end lie outside the available MAG data range for this spacecraft.\n\n"
+                            f"MAG coverage (UTC): [{tB0} – {tB1}].\n\n"
+                            "Fixes:  \n"
+                            "- Adjust CME start/end to lie within the MAG coverage shown above, OR  \n"
+                            "- Upload MAG data that covers the requested interval (include timezone info), OR  \n"
+                            "- If your MAG times are naive but actually UTC, ensure the file timestamps include 'Z' or convert them to UTC when reading."
+                        )
+                        st.stop()
+                except Exception as e:
+                    st.error(f"Could not validate MAG time coverage: {e}")
+                    st.stop()
+
+                # Create temporal panels styled to match spatial figures (colormap, horizontal cbar, plane markers)
+                try:
+                    B_rtn = np.asarray(B_rtn)
+                    if B_rtn.ndim != 2 or B_rtn.shape[1] < 3:
+                        st.error("MAG data shape unexpected (need Bx, By, Bz).")
+                        st.stop()
+
+                    Bx = B_rtn[:, 0]
+                    By = B_rtn[:, 1]
+                    Bz = B_rtn[:, 2]
+                    Bmag = np.sqrt(Bx**2 + By**2 + Bz**2)
+
+                    t_times = [ _ensure_utc(t) for t in t_B ]
+                    t_times_pd = pd.to_datetime(t_times)
+
+                    # Angle (unwrap) — consistent with earlier code (atan2(Bz, By))
+                    angles = np.degrees(np.unwrap(np.arctan2(Bz, By)))
+
+                    # Styling variables reused from spatial UI controls (fallback defaults)
+                    cmap_name = colormap_mag if 'colormap_mag' in locals() else "viridis"
+                    bg = bg_choice if 'bg_choice' in locals() else "white"
+                    s_size = scatter_size if 'scatter_size' in locals() else 3
+
+                    cmap_obj = plt.colormaps.get_cmap(cmap_name)
+                    finite_mask = np.isfinite(Bmag)
+                    if np.any(finite_mask):
+                        vmin = float(np.nanmin(Bmag[finite_mask]))
+                        vmax = float(np.nanmax(Bmag[finite_mask]))
+                        if vmin == vmax:
+                            vmin -= 1.0
+                            vmax += 1.0
+                    else:
+                        vmin, vmax = -1.0, 1.0
+
+                    # determine label color based on bg
+                    label_color = "white" if bg in ("black", "transparent") else "black"
+
+                    # ---- Angle vs Time (styled like spatial main panel) ----
+                    fig1 = plt.figure(figsize=(12, 4))
+                    ax1 = fig1.add_axes([0.05, 0.28, 0.86, 0.60])
+                    cax1 = fig1.add_axes([0.18, 0.12, 0.64, 0.05])  # horizontal colorbar below
+
+                    if bg == "transparent":
+                        fig1.patch.set_alpha(0.0)
+                        ax1.set_facecolor("none")
+                    else:
+                        fig1.patch.set_facecolor(bg)
+                        ax1.set_facecolor(bg)
+
+                    sc = ax1.scatter(t_times_pd, angles, c=Bmag, s=max(4, s_size*3), cmap=cmap_obj, vmin=vmin, vmax=vmax, alpha=0.95)
+
+                    # Add radial-field (B_R0 / Bx) on a secondary axis for direct comparison
+                    try:
+                        ax1_right = ax1.twinx()
+                        br_label = r"$B_{R_0}$ (nT)" if spacecraft_name != "Aditya L1" else r"$B_x$ (nT) — GSM"
+                        br_color = "C1"
+                        try:
+                            radial_for_plot = Bx
+                        except NameError:
+                            try:
+                                radial_for_plot = B_rtn[:,0]
+                            except Exception:
+                                radial_for_plot = None
+                        if radial_for_plot is not None:
+                            ax1_right.plot(t_times_pd, radial_for_plot, color=br_color, linewidth=0.9, alpha=0.9, label=br_label)
+                            ax1_right.set_ylabel(br_label, color=br_color)
+                            ax1_right.tick_params(axis="y", colors=br_color)
+                            ax1_right.legend(loc="upper right", fontsize=8)
+                    except Exception:
+                        pass
+
+                    # Vertical plane-like markers (drawn as translucent vertical rectangles)
+                    def add_vplane(ax, tval, color):
+                        ax.axvline(tval, color=color, linestyle="--", linewidth=1.0)
+                        # translucent rectangle to mimic plane breadth
+                        span = (t_cme_end - t_cme_start).total_seconds() * 0.001
+                        ax.axvspan(tval - timedelta(seconds=0), tval + timedelta(seconds=0), color=color, alpha=0.05)
+
+                    add_vplane(ax1, t_cme_start, "blue")
+                    add_vplane(ax1, t_mo_start, "blueviolet")
+                    add_vplane(ax1, t_cme_end, "red")
+
+                    ax1.set_ylabel("Angle (deg) — GSM if Aditya", color=label_color)
+                    ax1.set_xlabel("Time (UTC)", color=label_color)
+                    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+                    ax1.grid(True, which="both", linestyle="--", alpha=0.25)
+                    # horizontal colorbar below
+                    sm = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap=cmap_obj)
+                    sm.set_array([])
+                    cbar = fig1.colorbar(sm, cax=cax1, orientation="horizontal")
+                    cbar.set_label("|B| (nT)", color=label_color)
+                    cbar.ax.tick_params(colors=label_color)
+                    ax1.tick_params(colors=label_color)
+                    fig1.autofmt_xdate()
+
+                    st.pyplot(fig1)
+
+                    # ---- Hodogram: By vs Bz with concentric rotation grid lines ----
+                    fig2 = plt.figure(figsize=(6, 6))
+                    ax2 = fig2.add_subplot(111)
+                    if bg == "transparent":
+                        fig2.patch.set_alpha(0.0)
+                        ax2.set_facecolor("none")
+                    else:
+                        fig2.patch.set_facecolor(bg)
+                        ax2.set_facecolor(bg)
+
+                    sc2 = ax2.scatter(By, Bz, c=Bmag, s=max(4, s_size*2), cmap=cmap_obj, vmin=vmin, vmax=vmax, alpha=0.9)
+
+                    # concentric grid circles (rotation-style)
+                    max_rad = np.nanmax(np.sqrt(By**2 + Bz**2))
+                    if not np.isnan(max_rad) and max_rad > 0:
+                        levels = np.linspace(max_rad/4, max_rad, 4)
+                        for r in levels:
+                            circ = Circle((0.0, 0.0), radius=r, edgecolor="gray", facecolor="none", linestyle="--", alpha=0.35)
+                            ax2.add_artist(circ)
+                    ax2.axhline(0, color="k", linewidth=0.4, alpha=0.6)
+                    ax2.axvline(0, color="k", linewidth=0.4, alpha=0.6)
+
+                    ax2.set_xlabel(r"$B_Y$ (nT) — GSM" if spacecraft_name == "Aditya L1" else r"$B_Y$ (nT)", color=label_color)
+                    ax2.set_ylabel(r"$B_Z$ (nT) — GSM" if spacecraft_name == "Aditya L1" else r"$B_Z$ (nT)", color=label_color)
+                    ax2.grid(True, linestyle="--", alpha=0.2)
+                    cbar2 = fig2.colorbar(sc2, ax=ax2, orientation="vertical", pad=0.02)
+                    cbar2.set_label("|B| (nT)", color=label_color)
+                    cbar2.ax.tick_params(colors=label_color)
+                    ax2.tick_params(colors=label_color)
+                    st.pyplot(fig2)
+
+                    # ---- 3D temporal quiver to match spatial look (time numeric vs By vs Bz) ----
+                    try:
+                        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                        fig3 = plt.figure(figsize=(13, 8))
+                        ax3 = fig3.add_axes([0.05, 0.25, 0.86, 0.70], projection='3d')
+    
+                        if bg == "transparent":
+                            fig3.patch.set_alpha(0.0)
+                            ax3.set_facecolor("none")
+                        else:
+                            fig3.patch.set_facecolor(bg)
+                            ax3.set_facecolor(bg)
+    
+                        Xtime = mdates.date2num(t_times_pd)
+    
+                        # keep only finite indices
+                        finite_idx = np.isfinite(Bmag)
+                        Xtime_f = Xtime[finite_idx]
+                        Bx_f = Bx[finite_idx]
+                        By_f = By[finite_idx]
+                        Bz_f = Bz[finite_idx]
+                        Bmag_f = Bmag[finite_idx]
+    
+                        if len(Xtime_f) < 2:
+                            st.warning("Not enough points for 3D temporal quivers.")
+                            st.session_state["last_matplotlib_fig"] = None
+                            st.session_state["last_matplotlib_ax"] = None
+                        else:
+                            # emulate spatial axes scaling used in the static Matplotlib figure
+                            xlen_local = 4.0
+                            ylen_local = 1.0
+                            zlen_local = 1.0
+    
+                            span_x = float(np.nanmax(Xtime_f) - np.nanmin(Xtime_f))
+                            if span_x <= 0:
+                                span_x = 0.1
+                            yrange_local = span_x * ylen_local / xlen_local
+                            zrange_local = span_x * zlen_local / xlen_local
+    
+                            xmid_num = 0.5 * (np.nanmax(Xtime_f) + np.nanmin(Xtime_f))
+                            xlim_num = (xmid_num - span_x*0.55, xmid_num + span_x*0.55)
+                            ylim = (-yrange_local/2, yrange_local/2)
+                            zlim = (-zrange_local/2, zrange_local/2)
+                            ax3.set_xlim(xlim_num)
+                            ax3.set_ylim(ylim)
+                            ax3.set_zlim(zlim)
+                            ax3.set_box_aspect([xlen_local, ylen_local, zlen_local])
+    
+                            # color normalization same as elsewhere
+                            cmap_obj = plt.colormaps.get_cmap(cmap_name)
+                            finite_mask2 = np.isfinite(Bmag_f)
+                            if np.any(finite_mask2):
+                                vmin_f = float(np.nanmin(Bmag_f[finite_mask2]))
+                                vmax_f = float(np.nanmax(Bmag_f[finite_mask2]))
+                                if vmin_f == vmax_f:
+                                    vmin_f -= 1.0
+                                    vmax_f += 1.0
+                            else:
+                                vmin_f, vmax_f = -1.0, 1.0
+    
+                            # scale arrows similar to spatial quiver scaling
+                            Bvec = np.sqrt(Bx_f**2 + By_f**2 + Bz_f**2)
+                            Bmax = np.nanmax(Bvec) if np.any(np.isfinite(Bvec)) else 1.0
+                            B_scale_factor = 0.707 * yrange_local / Bmax if Bmax > 0 else 1.0
+    
+                            # subsample arrows to avoid clutter — densified by factor ~2
+                            arrow_step = max(1, len(Xtime_f) // max(1, int(arrow_density * 2)))
+                            idx_ar = np.arange(0, len(Xtime_f), arrow_step)
+    
+                            # Draw quivers: start at (time_numeric, 0, 0) with arrow components (u,v,w)
+                            for j in idx_ar:
+                                if not np.isfinite(Bmag_f[j]):
+                                    continue
+                                val = Bmag_f[j]
+                                val_norm = (val - vmin_f) / (vmax_f - vmin_f) if (vmax_f - vmin_f) != 0 else 0.5
+                                val_norm = float(np.clip(val_norm, 0.0, 1.0))
+                                rgba = to_rgba(cmap_obj(val_norm), alpha=1.0)
+    
+                                x0 = float(Xtime_f[j])
+                                y0 = 0.0  # baseline like spatial quivers (they originate on the mid-plane)
+                                z0 = 0.0
+    
+                                u = float(Bx_f[j]) * B_scale_factor  # extent along X (time axis)
+                                v = float(By_f[j]) * B_scale_factor
+                                w = float(Bz_f[j]) * B_scale_factor
+    
+                                ax3.quiver(
+                                    x0, y0, z0,
+                                    u, v, w,
+                                    length=1.0,
+                                    normalize=False,
+                                    pivot='tail',
+                                    arrow_length_ratio=0.08,
+                                    linewidth=0.9,
+                                    color=rgba,
+                                )
+    
+                            # cosmetic labels and horizontal colormap bar (like spatial)
+                            label_color = "white" if bg in ("black", "transparent") else "black"
+                            ax3.set_xlabel("Time (UTC numeric)", color=label_color)
+                            ax3.set_ylabel(r"$T_0$-like (arb)", color=label_color)
+                            ax3.set_zlabel(r"$N_0$-like (arb)", color=label_color)
+                            ax3.tick_params(colors=label_color)
+    
+                            # add horizontal colorbar under the axes (use a ScalarMappable)
+                            sm3 = ScalarMappable(norm=Normalize(vmin=vmin_f, vmax=vmax_f), cmap=cmap_obj)
+                            sm3.set_array([])
+                            cax_pos = fig3.add_axes([0.18, 0.16, 0.64, 0.055])
+                            cbar3 = fig3.colorbar(sm3, cax=cax_pos, orientation="horizontal")
+                            cbar3.set_label("|B| (nT)", color=label_color)
+                            cbar3.ax.tick_params(colors=label_color)
+                            cbar3.outline.set_edgecolor(label_color)
+    
+                            # annotate CME planes vertically (using numeric time) as translucent rectangular surfaces
+                            def add_vplane_num(ax, tnum, color, x_span_frac=0.01, y_frac=0.5, z_frac=0.5):
+                                """
+                                Draw a small translucent Y-Z rectangle at numeric x=tnum.
+                                x_span_frac: fraction of total X numeric span used to set the plane width (small).
+                                y_frac, z_frac: fraction of Y/Z ranges to set plane extents (0..1)
+                                """
+                                try:
+                                    # numeric span and midpoints
+                                    x_min_num = np.nanmin(Xtime_f)
+                                    x_max_num = np.nanmax(Xtime_f)
+                                    x_span_num = x_max_num - x_min_num if (x_max_num - x_min_num) != 0 else 1.0
+    
+                                    # plane width in numeric X units (very small so it looks like a slice)
+                                    half_dx = 0.5 * x_span_frac * x_span_num
+                                    x_plane = np.array([[tnum - half_dx, tnum - half_dx], [tnum + half_dx, tnum + half_dx]])
+    
+                                    # y/z spans centered around zero
+                                    y_center = 0.0
+                                    z_center = 0.0
+                                    y_half = 0.5 * (y_frac * (ylim[1] - ylim[0]))
+                                    z_half = 0.5 * (z_frac * (zlim[1] - zlim[0]))
+    
+                                    Yp = np.array([[y_center - y_half, y_center + y_half], [y_center - y_half, y_center + y_half]])
+                                    Zp = np.array([[z_center - z_half, z_center - z_half], [z_center + z_half, z_center + z_half]])
+    
+                                    ax.plot_surface(
+                                        x_plane,
+                                        Yp,
+                                        Zp,
+                                        color=color,
+                                        alpha=0.20,
+                                        linewidth=0.0,
+                                        shade=False,
+                                    )
+                                except Exception:
+                                    # fallback to a vertical dashed line if surface plotting fails
+                                    try:
+                                        ax.plot([tnum, tnum], [ylim[0], ylim[1]], [zlim[0], zlim[0]], color=color, linestyle="--", linewidth=1.0, alpha=0.8)
+                                    except Exception:
+                                        pass
+    
+                            add_vplane_num(ax3, mdates.date2num(t_cme_start), "blue")
+                            add_vplane_num(ax3, mdates.date2num(t_mo_start), "blueviolet")
+                            add_vplane_num(ax3, mdates.date2num(t_cme_end), "red")
+    
+                            # attempt to format x-axis ticks as date strings
+                            try:
+                                from matplotlib.ticker import FuncFormatter
+                                def num_to_date_short(x, pos=None):
+                                    return mdates.num2date(x).strftime("%m-%d\n%H:%M")
+                                ax3.xaxis.set_major_formatter(FuncFormatter(num_to_date_short))
+                            except Exception:
+                                pass
+    
+                            # store figure & axis for rotating GIF generation
+                            st.session_state["last_matplotlib_fig"] = fig3
+                            st.session_state["last_matplotlib_ax"] = ax3
+    
+                            # show the static figure inside a tabbed view (Temporal plot | GIFs)
+                            tab_temp_plot, tab_temp_gif = st.tabs(["Temporal plot", "GIFs"])
+                            with tab_temp_plot:
+                                st.pyplot(fig3)
+    
+                            # --- GIF tab: generate rotating temporal GIF or evolution GIF on demand ---
+                            with tab_temp_gif:
+                                if make_rot_gif_flag:
+                                    fig_static = st.session_state.get("last_matplotlib_fig", None)
+                                    ax_static = st.session_state.get("last_matplotlib_ax", None)
+                                    if fig_static is None or ax_static is None:
+                                        st.warning("No Matplotlib temporal figure available. Generate the static plot first (Matplotlib engine).")
+                                    else:
+                                        with st.spinner("Generating rotating temporal 3D GIF…"):
+                                            try:
+                                                rot_gif_bytes = make_rotation_gif_from_axes(
+                                                    fig_static,
+                                                    ax_static,
+                                                    dpi=gif_dpi,
+                                                    n_frames=gif_frames,
+                                                    elev=rot_elev,
+                                                    direction=rot_direction,
+                                                    frame_duration=rot_speed,
+                                                )
+                                                show_gif_inline(rot_gif_bytes.getvalue(), caption="Rotating temporal 3D (Matplotlib)")
+                                                st.download_button(
+                                                    "⬇️ Download rotating temporal 3D GIF",
+                                                    data=rot_gif_bytes.getvalue(),
+                                                    file_name=f"{spacecraft_name.replace(' ', '_')}_{event_name}_temporal_rotating.gif",
+                                                    mime="image/gif",
+                                                )
+                                            except Exception as _e:
+                                                st.warning(f"Could not create rotating temporal GIF: {_e}")
+                                else:
+                                    st.info("Enable 'Generate rotating 3D GIF' in Advanced plot & GIF settings to create a rotating GIF for the temporal Matplotlib view.")
+    
+                    except Exception as e:
+                        st.session_state["last_matplotlib_fig"] = None
+                        st.session_state["last_matplotlib_ax"] = None
+                        st.error(f"Temporal 3D (matplotlib) failed: {e}")
+                    # CSV download for temporal data
+                    df_temp = pd.DataFrame({
+                        "time": [t.isoformat() for t in t_times],
+                        "B_x_nT": Bx,
+                        "B_y_nT": By,
+                        "B_z_nT": Bz,
+                        "B_mag_nT": Bmag,
+                        "angle_deg": angles
+                    })
+                    csv_data = df_temp.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Download temporal CSV",
+                        data=csv_data,
+                        file_name=f"{spacecraft_name}_temporal.csv",
+                        mime="text/csv",
+                    )
+    
+                except Exception as e:
+                    st.error(f"Failed to create temporal plots: {e}")
+                st.stop()
+
+            # If we reach here, V and R exist -> permit spatial remap
             try:
                 check_time_coverage(
                     f"{spacecraft_name} MAG", t_B, t_cme_start, t_cme_end
@@ -1322,17 +1960,17 @@ with tab_remap:
                                 colorbar=dict(
                                 title=dict(text="|B| (nT)", font=dict(color=label_color)),
                                 tickfont=dict(color=label_color),
-                                len=0.70,       
-                                y=0.48,       
-                                thickness=12,    
-                                outlinewidth=0,  
+                                len=0.70,
+                                y=0.48,
+                                thickness=12,
+                                outlinewidth=0,
                                 ),
                             ),
                             name=f"{spacecraft_name}",
                         )
                     )
                     fig3d.update_layout(
-                        margin=dict(t=0, l=0, r=10, b=0),   # add more top margin (pixels)
+                        margin=dict(t=0, l=0, r=10, b=0),
                         title=dict(text=f"{spacecraft_name} — spatial remap ({event_name})", y=0.94, x=0.2),
                     )
 
@@ -1540,8 +2178,8 @@ with tab_remap:
 
                     # Larger main plot, shorter & separated colorbars
                     ax = fig.add_axes([0.05, 0.25, 0.86, 0.70], projection="3d")
-                    cax_mag = fig.add_axes([0.15, 0.20, 0.70, 0.035])  
-                    cax_br  = fig.add_axes([0.15, 0.10, 0.70, 0.035])
+                    cax_mag = fig.add_axes([0.15, 0.20, 0.70, 0.035])
+                    cax_br = fig.add_axes([0.15, 0.10, 0.70, 0.035])
 
 
                     xlen, ylen, zlen = 4, 1, 1
@@ -1798,15 +2436,10 @@ with tab_remap:
                         fig_static = st.session_state.get("last_matplotlib_fig", None)
                         ax_static = st.session_state.get("last_matplotlib_ax", None)
 
-                        if plot_engine != "Matplotlib (static)":
-                            st.warning(
-                                "Switch to **Matplotlib (static)** and generate the plot "
-                                "first to enable the rotating GIF."
-                            )
-                        elif fig_static is None or ax_static is None:
+                        if fig_static is None or ax_static is None:
                             st.warning(
                                 "No Matplotlib figure available. Generate the static "
-                                "plot first."
+                                "plot first (Matplotlib engine or temporal 3D)."
                             )
                         else:
                             with st.spinner("Generating rotating 3D GIF…"):
@@ -1840,12 +2473,11 @@ with tab_remap:
             st.stop()
 
 # -----------------------------------------------------------------------------#
-# DONKI helper tab
+# DONKI helper tab (unchanged)
 # -----------------------------------------------------------------------------#
 
 with tab_donki:
     st.subheader("NASA DONKI CME catalog helper")
-
     st.markdown(
         """
 Use this tab to query NASA's DONKI CME catalog and inspect events.

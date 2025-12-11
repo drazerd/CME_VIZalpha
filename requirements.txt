@@ -10,3 +10,4 @@ cdflib
 imageio
 kaleido
 requests
+NetCDF4
