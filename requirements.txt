@@ -11,3 +11,5 @@ imageio
 kaleido
 requests
 NetCDF4
+sklearn
+scipy

@@ -1137,7 +1137,7 @@ with st.sidebar:
         uploaded_netcdf = st.file_uploader(
             "Upload Aditya L1 MAG netCDF (.nc) files (GSM)",
             type=["nc"],
-            accept_multiple_files=True,
+            accept_multiple_files=False,
         )
 
     # Temporal-only checkbox BEFORE CSV upload widgets so we can hide V/R when temporal-only
@@ -1152,8 +1152,6 @@ with st.sidebar:
     if data_mode == "Upload CSVs":
         if spacecraft_name == "Aditya L1":
             st.warning("For Aditya L1 prefer uploading .nc files (use the NETCDF uploader shown above). CSV RTN uploads are not provided for Aditya L1.")
-            # still allow a generic MAG CSV if user insists
-            uploaded_mag = st.file_uploader("MAG CSV (GSM) — optional", type=["csv"])
         else:
             st.caption("Use the same column naming convention as your existing CSVs.")
             uploaded_mag = st.file_uploader("MAG RTN CSV", type=["csv"])
